@@ -2,83 +2,78 @@ import os
 import subprocess
 import time
 from typing import Generator
-
 import pytest
 import requests
 from dotenv import load_dotenv
 from faker import Faker
 from passlib.context import CryptContext
-from playwright.sync_api import sync_playwright
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
-
-from app.models import Base, User  # Ensure these imports are correct based on your project structure
+from playwright.sync_api import sync_playwright, Browser, Page  # Added necessary imports
+from app.models import (
+    Base,
+    User,
+    Addition,
+    Subtraction,
+    Multiplication,
+    Division,
+)
 from app.schemas import UserData
-from app.settings import Settings  # Adjust the import path based on where Settings is defined
+from app.settings import Settings
 
-
-# Initialize Faker and Passlib's CryptContext
+# Initialize Faker and Password Hasher
 fake = Faker()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Pydantic Settings for Configuration (Ensure this matches your main application settings)
+# Test Settings
 class TestSettings(Settings):
     class Config:
         env_prefix = "TEST_DB_"  # Prefix for test database environment variables
 
-# Instantiate test settings
 test_settings = TestSettings()
 
-# Define the test database URL
+# Define test database URL
 TEST_DATABASE_URL = (
-    f'postgresql://{test_settings.db_user}:'
-    f'{test_settings.db_password}@{test_settings.db_host}:'
-    f'{test_settings.db_port}/{test_settings.db_name}'
+    f'postgresql://{test_settings.db_user}:{test_settings.db_password}'
+    f'@{test_settings.db_host}:{test_settings.db_port}/{test_settings.db_name}'
 )
 
-
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def engine() -> Generator:
     """
     Creates a SQLAlchemy engine connected to the test database.
     """
-    engine = create_engine(TEST_DATABASE_URL, echo=False)  # Set echo=True for verbose SQL logging
+    engine = create_engine(TEST_DATABASE_URL, echo=False)
     try:
         yield engine
     finally:
         engine.dispose()
 
-
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def SessionLocal(engine) -> Generator:
     """
-    Creates a configured SQLAlchemy sessionmaker bound to the test engine.
+    Creates a sessionmaker bound to the test engine.
     """
     Session = sessionmaker(bind=engine)
     yield Session
-    # No teardown needed for sessionmaker
 
-
-@pytest.fixture(scope='session', autouse=True)
+@pytest.fixture(scope="session", autouse=True)
 def setup_database(engine):
     """
     Creates all tables before tests and drops them after all tests.
     """
-    # Create tables
     Base.metadata.create_all(engine)
     yield
-    # Drop tables
-    # Base.metadata.drop_all(engine)
+    Base.metadata.drop_all(engine)
 
-
-@pytest.fixture(scope='function')
+@pytest.fixture(scope="function")
 def db_session(SessionLocal) -> Generator:
     """
-    Creates a new database session for a test and rolls back after the test.
+    Provides a SQLAlchemy session for a test and rolls back after the test.
     """
     session = SessionLocal()
     try:
@@ -89,106 +84,113 @@ def db_session(SessionLocal) -> Generator:
     finally:
         session.close()
 
-
-@pytest.fixture(scope='function')
+@pytest.fixture(scope="function")
 def test_user(db_session) -> User:
     """
-    Creates and returns a test user in the database.
+    Creates a test user in the database.
     """
-    # Generate fake user data
     plain_password = fake.password(length=12)
-    user_data = UserData(
+    hashed_password = pwd_context.hash(plain_password + test_settings.salt)
+    user = User(
         first_name=fake.first_name(),
         last_name=fake.last_name(),
         email=fake.unique.email(),
-        username=fake.unique.user_name(),
-        password=plain_password
+        username="user" + fake.unique.user_name(),
+        password=hashed_password,
     )
-    # Hash the password with salt from test settings
-    hashed_password = pwd_context.hash(user_data.password + test_settings.salt)
-    
-    # Create User instance
-    user = User(
-        first_name=user_data.first_name,
-        last_name=user_data.last_name,
-        email=user_data.email,
-        username=user_data.username,
-        password=hashed_password
-    )
-    
-    # Add to session and commit
     db_session.add(user)
     db_session.commit()
-    db_session.refresh(user)  # Refresh to get updated fields like id
-    
+    db_session.refresh(user)
     return user
 
+@pytest.fixture(scope="function")
+def test_calculations(db_session, test_user):
+    """
+    Creates a set of test calculations for a test user.
+    """
+    calculations = [
+        Addition(user_id=test_user.id, inputs=[1, 2]),
+        Subtraction(user_id=test_user.id, inputs=[10, 5]),
+        Multiplication(user_id=test_user.id, inputs=[3, 4]),
+        Division(user_id=test_user.id, inputs=[20, 4]),
+    ]
+    db_session.add_all(calculations)
+    db_session.commit()
+    return calculations
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="function")
+def create_calculation(db_session, test_user):
+    """
+    Fixture to dynamically create calculations during tests.
+    """
+    def _create_calculation(calc_type: str, inputs: list[float]):
+        calculation_class = {
+            "addition": Addition,
+            "subtraction": Subtraction,
+            "multiplication": Multiplication,
+            "division": Division,
+        }.get(calc_type.lower())
+        if not calculation_class:
+            raise ValueError(f"Unsupported calculation type: {calc_type}")
+        calculation = calculation_class(user_id=test_user.id, inputs=inputs)
+        db_session.add(calculation)
+        db_session.commit()
+        return calculation
+
+    return _create_calculation
+
+@pytest.fixture(scope="session")
 def fastapi_server():
     """
-    Fixture to start the FastAPI server before E2E tests and stop it after tests complete.
+    Starts the FastAPI server before E2E tests and stops it afterward.
     """
-    # Start FastAPI app
-    fastapi_process = subprocess.Popen(['python', 'main.py'])
-    
-    # Define the URL to check if the server is up
-    server_url = 'http://127.0.0.1:8000/'
-    
-    # Wait for the server to start by polling the root endpoint
-    timeout = 30  # seconds
+    fastapi_process = subprocess.Popen(["python", "main.py"])
+    server_url = "http://127.0.0.1:8000/"
+    timeout = 30
     start_time = time.time()
-    server_up = False
-    
+
     print("Starting FastAPI server...")
-    
+
     while time.time() - start_time < timeout:
         try:
             response = requests.get(server_url)
             if response.status_code == 200:
-                server_up = True
                 print("FastAPI server is up and running.")
                 break
         except requests.exceptions.ConnectionError:
             pass
         time.sleep(1)
-    
-    if not server_up:
+    else:
         fastapi_process.terminate()
         raise RuntimeError("FastAPI server failed to start within timeout period.")
-    
+
     yield
-    
-    # Terminate FastAPI server
     print("Shutting down FastAPI server...")
     fastapi_process.terminate()
     fastapi_process.wait()
     print("FastAPI server has been terminated.")
 
-
 @pytest.fixture(scope="session")
 def playwright_instance_fixture():
     """
-    Fixture to manage Playwright's lifecycle.
+    Manages Playwright's lifecycle.
     """
     with sync_playwright() as p:
         yield p
 
-
 @pytest.fixture(scope="session")
-def browser(playwright_instance_fixture):
+def browser(playwright_instance_fixture) -> Browser: # type: ignore
     """
-    Fixture to launch a browser instance.
+    Launches a Playwright browser instance.
     """
     browser = playwright_instance_fixture.chromium.launch(headless=True)
     yield browser
     browser.close()
 
-
 @pytest.fixture(scope="function")
-def page(browser):
+def page(browser: Browser) -> Page: # type: ignore
     """
-    Fixture to create a new page for each test.
+    Provides a new Playwright page for each test.
     """
     page = browser.new_page()
     yield page
